@@ -1,5 +1,4 @@
-cat << 'EOF' > .gitignore
-.relay-env
+.relay-env/
 __pycache__/
 *.pyc
 .venv/
@@ -7,4 +6,4 @@ venv/
 data/papers/*.pdf
 data/index/
 traces.jsonl
-EOF
+.env
