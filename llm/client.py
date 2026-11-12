@@ -230,6 +230,8 @@ class UnifiedLLMClient:
                     # Budget-aware check: do not sleep & retry if backoff + 1.0s work > remaining patience!
                     elapsed_ms = res.queue_wait_ms + (time.perf_counter() - t_work_start) * 1000.0
                     if (elapsed_ms + (backoff_sec + 0.8) * 1000.0) >= remaining_budget_ms:
+                        res.status = "timeout"
+                        res.error_detail = "retry_backoff_exceeds_patience"
                         break
 
                 attempt += 1

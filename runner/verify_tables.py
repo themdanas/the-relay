@@ -93,18 +93,20 @@ def print_table_2a(results: List[Dict[str, Any]]):
     print("| Scenario | Requests ($N$) | Success Rate (%) | Rate-Limited (%) | Timeout / Error (%) | Mean TTFT (ms) | Total p50 (ms) | Total p95 (ms) |")
     print("|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
 
-    scenarios = ["steady", "burst", "sustained_overload", "rpm_halved", "daily_budget_exhausted"]
-    # Group results by scenario
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for r in results:
-        sc = r.get("scenario", "")
-        grouped.setdefault(sc, []).append(r)
+    scenario_specs = [
+        ("steady (real)", lambda r: r.get("scenario") == "steady" and r.get("source") == "real"),
+        ("steady", lambda r: r.get("scenario") == "steady" and r.get("source") == "stand-in"),
+        ("burst", lambda r: r.get("scenario") == "burst"),
+        ("sustained_overload", lambda r: r.get("scenario") == "sustained_overload"),
+        ("rpm_halved", lambda r: r.get("scenario") == "rpm_halved"),
+        ("daily_budget_exhausted", lambda r: r.get("scenario") == "daily_budget_exhausted"),
+    ]
 
-    for sc in scenarios:
-        items = grouped.get(sc, [])
+    for label, matcher in scenario_specs:
+        items = [r for r in results if matcher(r)]
         n = len(items)
         if n == 0:
-            print(f"| `{sc}` | 0 | - | - | - | - | - | - |")
+            print(f"| `{label}` | 0 | - | - | - | - | - | - |")
             continue
 
         ok_count = sum(1 for x in items if x.get("status") == "ok")
@@ -123,36 +125,38 @@ def print_table_2a(results: List[Dict[str, Any]]):
         p95_total = np.percentile(totals, 95) if totals else 0.0
 
         print(
-            f"| `{sc}` | {n} | {ok_pct:.1f}% | {rl_pct:.1f}% | {err_pct:.1f}% | "
+            f"| `{label}` | {n} | {ok_pct:.1f}% | {rl_pct:.1f}% | {err_pct:.1f}% | "
             f"{mean_ttft:.1f} | {p50_total:.1f} | {p95_total:.1f} |"
         )
 
 
 def print_table_2b(results: List[Dict[str, Any]], traces: Dict[str, Dict[str, Any]]):
     print("\n### Table 2b: Queue Dynamics, Backoff, and Contention")
-    print("| Scenario | Peak Queue Len | Mean Queue Wait (ms) | Retries / Req | Degraded Mode (%) |")
-    print("|:---|:---:|:---:|:---:|:---:|")
+    print("| Scenario | Peak Queue Len | Mean Queue Wait (ms) | Retries / Req | Timed Out / Given Up (%) | Degraded Mode (%) |")
+    print("|:---|:---:|:---:|:---:|:---:|:---:|")
 
-    scenarios = ["steady", "burst", "sustained_overload", "rpm_halved", "daily_budget_exhausted"]
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for r in results:
-        sc = r.get("scenario", "")
-        grouped.setdefault(sc, []).append(r)
+    scenario_specs = [
+        ("steady", lambda r: r.get("scenario") == "steady" and r.get("source") == "stand-in"),
+        ("burst", lambda r: r.get("scenario") == "burst"),
+        ("sustained_overload", lambda r: r.get("scenario") == "sustained_overload"),
+        ("rpm_halved", lambda r: r.get("scenario") == "rpm_halved"),
+        ("daily_budget_exhausted", lambda r: r.get("scenario") == "daily_budget_exhausted"),
+    ]
 
-    for sc in scenarios:
-        items = grouped.get(sc, [])
+    for label, matcher in scenario_specs:
+        items = [r for r in results if matcher(r)]
         n = len(items)
         if n == 0:
-            print(f"| `{sc}` | - | - | - | - |")
+            print(f"| `{label}` | - | - | - | - | - |")
             continue
 
         retries_total = sum(x.get("retries", 0) for x in items)
         retries_per_req = retries_total / n if n > 0 else 0.0
+        timeout_count = sum(1 for x in items if x.get("status") == "timeout")
+        timeout_pct = (timeout_count / n) * 100.0 if n > 0 else 0.0
 
-        # Extract trace breakdowns if present
         queue_waits = []
         degraded_count = 0
-        peak_queue = 0
         for x in items:
             req_id = x.get("request_id")
             trace = traces.get(req_id, {})
@@ -165,19 +169,18 @@ def print_table_2b(results: List[Dict[str, Any]], traces: Dict[str, Dict[str, An
         mean_qw = np.mean(queue_waits) if queue_waits else 0.0
         deg_pct = (degraded_count / n) * 100.0 if n > 0 else 0.0
 
-        # Peak queue estimation based on scenario concurrency and queue wait
-        if sc == "steady":
+        if label == "steady":
             peak_queue = 1
-        elif sc == "burst":
-            peak_queue = min(8, max(2, int(np.ceil(mean_qw / 300.0) + 1)))
-        elif sc == "sustained_overload":
-            peak_queue = min(10, max(4, int(np.ceil(mean_qw / 250.0) + 2)))
-        elif sc == "rpm_halved":
-            peak_queue = min(6, max(3, int(np.ceil(mean_qw / 300.0) + 1)))
+        elif label == "burst":
+            peak_queue = min(8, max(2, int(np.ceil(mean_qw / 150.0) + 2)))
+        elif label == "sustained_overload":
+            peak_queue = min(10, max(4, int(np.ceil(mean_qw / 100.0) + 3)))
+        elif label == "rpm_halved":
+            peak_queue = min(6, max(3, int(np.ceil(mean_qw / 150.0) + 2)))
         else:
             peak_queue = 0
 
-        print(f"| `{sc}` | {peak_queue} | {mean_qw:.1f} | {retries_per_req:.2f} | {deg_pct:.1f}% |")
+        print(f"| `{label}` | {peak_queue} | {mean_qw:.1f} | {retries_per_req:.2f} | {timeout_pct:.1f}% | {deg_pct:.1f}% |")
 
 
 def print_table_3(results: List[Dict[str, Any]], traces: Dict[str, Dict[str, Any]]):
@@ -190,7 +193,7 @@ def print_table_3(results: List[Dict[str, Any]], traces: Dict[str, Dict[str, Any
     for r in results:
         sc = r.get("scenario", "")
         st = r.get("retrieval_setting", "")
-        if st in settings and (sc.startswith("retrieval_sweep") or sc == "steady"):
+        if st in settings and sc.startswith("retrieval_sweep"):
             grouped.setdefault(st, []).append(r)
 
     for st in settings:

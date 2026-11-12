@@ -69,6 +69,9 @@ class RateLimitGovernor:
         self.peak_queue_length = 0
         self.retry_after_until = 0.0
         self.daily_exhausted_flag = False
+        self.remaining_tpm = self.limit_tpm
+        self.remaining_rpd = self.limit_rpd
+        self._sem = asyncio.Semaphore(self.max_concurrency)
 
     def update_from_headers(self, headers: Dict[str, str], status_code: int = 200, error_body: str = "") -> None:
         h = {k.lower(): v for k, v in headers.items()}
@@ -126,20 +129,23 @@ class RateLimitGovernor:
             # 1. Admission check: if a global 429 cooldown is active and longer than our patience budget, shed immediately!
             now = time.monotonic()
             cooldown_sec = max(0.0, self.retry_after_until - now)
-            # Requests at Step 1 are shed more aggressively than requests at Step 3/4 that already invested tokens
-            max_allowed_wait_sec = (remaining_budget_ms / 1000.0) * (0.45 if step_num == 1 else 0.75)
+            time_left_sec = remaining_budget_ms / 1000.0
 
-            if cooldown_sec > max_allowed_wait_sec:
-                raise PermissionError(
-                    f"rate_limited_shed: Cooldown ({cooldown_sec:.2f}s) exceeds step budget ({max_allowed_wait_sec:.2f}s)"
+            # If required cooldown exceeds patience budget, wait until patience budget expires, then time out
+            if cooldown_sec > time_left_sec:
+                if time_left_sec > 0:
+                    await asyncio.sleep(time_left_sec)
+                raise asyncio.TimeoutError(
+                    f"patience_exceeded: Cooldown ({cooldown_sec:.2f}s) exceeds budget ({time_left_sec:.2f}s)"
                 )
 
+            # If cooldown is active but within budget, wait for cooldown
             if cooldown_sec > 0:
                 await asyncio.sleep(cooldown_sec)
 
             # 2. Wait for concurrency semaphore within remaining patience budget
             elapsed_sec = time.perf_counter() - t0
-            sem_timeout = max(0.05, (remaining_budget_ms / 1000.0) - elapsed_sec)
+            sem_timeout = max(0.01, (remaining_budget_ms / 1000.0) - elapsed_sec)
             await asyncio.wait_for(self._sem.acquire(), timeout=sem_timeout)
 
             wait_ms = (time.perf_counter() - t0) * 1000.0

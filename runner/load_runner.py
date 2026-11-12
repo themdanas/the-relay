@@ -32,6 +32,7 @@ from config import (
     STANDIN_BASE_URL,
     RETRIEVAL_SETTINGS,
     USER_PATIENCE_BUDGET_MS,
+    GROQ_API_KEY,
 )
 from eval.questions import EVAL_QUESTIONS, EvalQuestion
 from ingest.indexer import LibraryIndexer
@@ -204,127 +205,258 @@ async def main():
     print("[INIT] Loading indexer models...")
     indexer = LibraryIndexer(load_models=True)
 
-    # Stand-in server manager
     standin_mgr = StandInServerManager()
-    if args.source == "stand-in":
-        standin_mgr.start()
-
-    # Governor & unified client
-    gov = RateLimitGovernor(max_concurrency=12)
-    client = UnifiedLLMClient(source=args.source, governor=gov, max_retries=2)
-    pipeline = RelayPipeline(indexer, client)
 
     try:
-        scenarios_to_run = (
-            ["steady", "burst", "sustained_overload", "rpm_halved", "daily_budget_exhausted", "retrieval_sweep"]
-            if args.scenario == "all"
-            else [args.scenario]
-        )
+        # -------------------------------------------------------------------
+        # Full Suite Mode: runs Real Groq (5 questions) + Calibrated Stand-In
+        # -------------------------------------------------------------------
+        if args.scenario == "all":
+            # 1. Real Groq run (5 questions) if API key is present
+            if GROQ_API_KEY:
+                print("\n" + "=" * 70)
+                print("  [STEP 1/2] RUNNING REAL GROQ API BENCHMARK (5 questions, steady)")
+                print("=" * 70)
+                real_gov = RateLimitGovernor(max_concurrency=2)
+                real_client = UnifiedLLMClient(source="real", governor=real_gov, max_retries=2)
+                real_pipeline = RelayPipeline(indexer, real_client)
+                try:
+                    await execute_scenario(
+                        scenario_name="steady",
+                        questions=EVAL_QUESTIONS[:5],
+                        pipeline=real_pipeline,
+                        source="real",
+                        concurrency=1,
+                        csv_writer=csv_writer,
+                        traces_writer=traces_writer,
+                        retrieval_setting=DEFAULT_RETRIEVAL_SETTING,
+                    )
+                finally:
+                    await real_client.close()
+            else:
+                print("[WARN] GROQ_API_KEY not found; skipping real Groq run.")
 
-        for sc in scenarios_to_run:
-            client.governor.reset_stats()
+            # 2. Stand-in Server Suite
+            print("\n" + "=" * 70)
+            print("  [STEP 2/2] RUNNING CALIBRATED STAND-IN SERVER BENCHMARK SUITE")
+            print("=" * 70)
+            standin_mgr.start()
+            standin_gov = RateLimitGovernor(max_concurrency=12)
+            standin_client = UnifiedLLMClient(source="stand-in", governor=standin_gov, max_retries=2)
+            standin_pipeline = RelayPipeline(indexer, standin_client)
 
-            if sc == "steady":
-                # Real Groq mode: run 5 questions to conserve quota
-                q_list = EVAL_QUESTIONS if args.source == "stand-in" else EVAL_QUESTIONS[:5]
-                standin_mgr.configure(rpm_limit=60, tpm_limit=40000, rpd_remaining=1000, slow_tail_prob=0.0, reset_window=True)
-                gov.max_concurrency = args.concurrency or 2
-                client.governor.daily_exhausted_flag = False
+            try:
+                # Scenario A: steady (16 questions, baseline load)
+                standin_mgr.configure(rpm_limit=60, tpm_limit=50000, rpd_remaining=1000, slow_tail_prob=0.0, reset_window=True)
+                standin_gov.max_concurrency = 2
+                standin_gov.reset_stats()
                 await execute_scenario(
                     scenario_name="steady",
-                    questions=q_list,
-                    pipeline=pipeline,
-                    source=args.source,
-                    concurrency=args.concurrency or 2,
+                    questions=EVAL_QUESTIONS,
+                    pipeline=standin_pipeline,
+                    source="stand-in",
+                    concurrency=2,
                     csv_writer=csv_writer,
                     traces_writer=traces_writer,
                 )
 
-            elif sc == "burst":
-                standin_mgr.configure(rpm_limit=30, tpm_limit=14000, rpd_remaining=1000, slow_tail_prob=0.05)
-                gov.max_concurrency = args.concurrency or 8
-                client.governor.daily_exhausted_flag = False
+                # Scenario B: burst (16 questions, concurrency surge)
+                standin_mgr.configure(rpm_limit=30, tpm_limit=18000, rpd_remaining=1000, slow_tail_prob=0.05, reset_window=True)
+                standin_gov.max_concurrency = 6
+                standin_gov.reset_stats()
                 await execute_scenario(
                     scenario_name="burst",
                     questions=EVAL_QUESTIONS,
-                    pipeline=pipeline,
-                    source=args.source,
-                    concurrency=args.concurrency or 8,
+                    pipeline=standin_pipeline,
+                    source="stand-in",
+                    concurrency=6,
                     csv_writer=csv_writer,
                     traces_writer=traces_writer,
                 )
 
-            elif sc == "sustained_overload":
-                # 32 requests (16 questions repeated twice) under tight limits and tail jitter
-                q_list = EVAL_QUESTIONS + EVAL_QUESTIONS
+                # Scenario C: sustained_overload (32 requests, tight limits & tail jitter)
                 standin_mgr.configure(
-                    rpm_limit=20,
-                    tpm_limit=7000,
+                    rpm_limit=25,
+                    tpm_limit=10000,
                     rpd_remaining=1000,
-                    slow_tail_prob=0.12,
-                    random_503_prob=0.03,
+                    slow_tail_prob=0.08,
+                    random_503_prob=0.02,
+                    reset_window=True,
                 )
-                gov.max_concurrency = args.concurrency or 10
-                client.governor.daily_exhausted_flag = False
+                standin_gov.max_concurrency = 8
+                standin_gov.reset_stats()
                 await execute_scenario(
                     scenario_name="sustained_overload",
-                    questions=q_list,
-                    pipeline=pipeline,
-                    source=args.source,
-                    concurrency=args.concurrency or 10,
+                    questions=EVAL_QUESTIONS + EVAL_QUESTIONS,
+                    pipeline=standin_pipeline,
+                    source="stand-in",
+                    concurrency=8,
                     csv_writer=csv_writer,
                     traces_writer=traces_writer,
                 )
 
-            elif sc == "rpm_halved":
-                # Halved rate-limit capacity (15 RPM, 4000 TPM)
-                standin_mgr.configure(rpm_limit=15, tpm_limit=4000, rpd_remaining=1000, slow_tail_prob=0.05)
-                gov.max_concurrency = args.concurrency or 6
-                client.governor.daily_exhausted_flag = False
+                # Scenario D: rpm_halved (16 questions, 15 RPM / 6000 TPM)
+                standin_mgr.configure(rpm_limit=15, tpm_limit=6000, rpd_remaining=1000, slow_tail_prob=0.04, reset_window=True)
+                standin_gov.max_concurrency = 3
+                standin_gov.reset_stats()
                 await execute_scenario(
                     scenario_name="rpm_halved",
                     questions=EVAL_QUESTIONS,
-                    pipeline=pipeline,
-                    source=args.source,
-                    concurrency=args.concurrency or 6,
+                    pipeline=standin_pipeline,
+                    source="stand-in",
+                    concurrency=3,
                     csv_writer=csv_writer,
                     traces_writer=traces_writer,
                 )
 
-            elif sc == "daily_budget_exhausted":
-                # Daily RPD / TPD exhausted -> triggers fast local retrieval fallback
-                standin_mgr.configure(rpd_remaining=0)
-                client.governor.daily_exhausted_flag = True
+                # Scenario E: daily_budget_exhausted (16 questions, instant local fallback)
+                standin_mgr.configure(rpd_remaining=0, reset_window=True)
+                standin_gov.max_concurrency = 4
+                standin_gov.reset_stats()
+                standin_gov.daily_exhausted_flag = True
+                standin_gov.remaining_rpd = 0
                 await execute_scenario(
                     scenario_name="daily_budget_exhausted",
                     questions=EVAL_QUESTIONS,
-                    pipeline=pipeline,
-                    source=args.source,
-                    concurrency=args.concurrency or 4,
+                    pipeline=standin_pipeline,
+                    source="stand-in",
+                    concurrency=4,
                     csv_writer=csv_writer,
                     traces_writer=traces_writer,
                 )
-                client.governor.daily_exhausted_flag = False
+                standin_gov.daily_exhausted_flag = False
 
-            elif sc == "retrieval_sweep":
-                # Reset stand-in to generous limits for clean retrieval comparison
-                standin_mgr.configure(rpm_limit=60, tpm_limit=45000, rpd_remaining=1000, slow_tail_prob=0.0, reset_window=True)
-                gov.max_concurrency = args.concurrency or 2
-                client.governor.daily_exhausted_flag = False
-
+                # Scenario F: retrieval_sweep (S1, S2, S3 across 16 questions for Table 3)
                 for s_name in ["S1_180tok_k3_norerank", "S2_450tok_k4_rerank", "S3_900tok_k6_norerank"]:
-                    client.governor.reset_stats()
-                    standin_mgr.configure(rpm_limit=60, tpm_limit=45000, rpd_remaining=1000, slow_tail_prob=0.0, reset_window=True)
+                    standin_gov.max_concurrency = 2
+                    standin_gov.reset_stats()
+                    standin_mgr.configure(rpm_limit=60, tpm_limit=120000, rpd_remaining=1000, slow_tail_prob=0.0, reset_window=True)
                     await execute_scenario(
                         scenario_name=f"retrieval_sweep_{s_name}",
                         questions=EVAL_QUESTIONS,
+                        pipeline=standin_pipeline,
+                        source="stand-in",
+                        concurrency=2,
+                        csv_writer=csv_writer,
+                        traces_writer=traces_writer,
+                        retrieval_setting=s_name,
+                    )
+            finally:
+                await standin_client.close()
+
+        else:
+            # ---------------------------------------------------------------
+            # Single-Scenario Mode
+            # ---------------------------------------------------------------
+            if args.source == "stand-in":
+                standin_mgr.start()
+
+            gov = RateLimitGovernor(max_concurrency=args.concurrency or 6)
+            client = UnifiedLLMClient(source=args.source, governor=gov, max_retries=2)
+            pipeline = RelayPipeline(indexer, client)
+
+            try:
+                gov.reset_stats()
+                sc = args.scenario
+                if sc == "steady":
+                    q_list = EVAL_QUESTIONS if args.source == "stand-in" else EVAL_QUESTIONS[:5]
+                    if args.source == "stand-in":
+                        standin_mgr.configure(rpm_limit=60, tpm_limit=40000, rpd_remaining=1000, slow_tail_prob=0.0, reset_window=True)
+                    gov.max_concurrency = args.concurrency or 2
+                    gov.reset_stats()
+                    await execute_scenario(
+                        scenario_name="steady",
+                        questions=q_list,
                         pipeline=pipeline,
                         source=args.source,
                         concurrency=args.concurrency or 2,
                         csv_writer=csv_writer,
                         traces_writer=traces_writer,
-                        retrieval_setting=s_name,
                     )
+                elif sc == "burst":
+                    if args.source == "stand-in":
+                        standin_mgr.configure(rpm_limit=30, tpm_limit=14000, rpd_remaining=1000, slow_tail_prob=0.08, reset_window=True)
+                    gov.max_concurrency = args.concurrency or 8
+                    gov.reset_stats()
+                    await execute_scenario(
+                        scenario_name="burst",
+                        questions=EVAL_QUESTIONS,
+                        pipeline=pipeline,
+                        source=args.source,
+                        concurrency=args.concurrency or 8,
+                        csv_writer=csv_writer,
+                        traces_writer=traces_writer,
+                    )
+                elif sc == "sustained_overload":
+                    q_list = EVAL_QUESTIONS + EVAL_QUESTIONS
+                    if args.source == "stand-in":
+                        standin_mgr.configure(
+                            rpm_limit=20,
+                            tpm_limit=7000,
+                            rpd_remaining=1000,
+                            slow_tail_prob=0.12,
+                            random_503_prob=0.03,
+                            reset_window=True,
+                        )
+                    gov.max_concurrency = args.concurrency or 10
+                    gov.reset_stats()
+                    await execute_scenario(
+                        scenario_name="sustained_overload",
+                        questions=q_list,
+                        pipeline=pipeline,
+                        source=args.source,
+                        concurrency=args.concurrency or 10,
+                        csv_writer=csv_writer,
+                        traces_writer=traces_writer,
+                    )
+                elif sc == "rpm_halved":
+                    if args.source == "stand-in":
+                        standin_mgr.configure(rpm_limit=15, tpm_limit=4000, rpd_remaining=1000, slow_tail_prob=0.04, reset_window=True)
+                    gov.max_concurrency = args.concurrency or 4
+                    gov.reset_stats()
+                    await execute_scenario(
+                        scenario_name="rpm_halved",
+                        questions=EVAL_QUESTIONS,
+                        pipeline=pipeline,
+                        source=args.source,
+                        concurrency=args.concurrency or 4,
+                        csv_writer=csv_writer,
+                        traces_writer=traces_writer,
+                    )
+                elif sc == "daily_budget_exhausted":
+                    if args.source == "stand-in":
+                        standin_mgr.configure(rpd_remaining=0, reset_window=True)
+                    gov.max_concurrency = args.concurrency or 4
+                    gov.reset_stats()
+                    gov.daily_exhausted_flag = True
+                    gov.remaining_rpd = 0
+                    await execute_scenario(
+                        scenario_name="daily_budget_exhausted",
+                        questions=EVAL_QUESTIONS,
+                        pipeline=pipeline,
+                        source=args.source,
+                        concurrency=args.concurrency or 4,
+                        csv_writer=csv_writer,
+                        traces_writer=traces_writer,
+                    )
+                elif sc == "retrieval_sweep":
+                    for s_name in ["S1_180tok_k3_norerank", "S2_450tok_k4_rerank", "S3_900tok_k6_norerank"]:
+                        if args.source == "stand-in":
+                            standin_mgr.configure(rpm_limit=60, tpm_limit=120000, rpd_remaining=1000, slow_tail_prob=0.0, reset_window=True)
+                        gov.max_concurrency = args.concurrency or 2
+                        gov.reset_stats()
+                        await execute_scenario(
+                            scenario_name=f"retrieval_sweep_{s_name}",
+                            questions=EVAL_QUESTIONS,
+                            pipeline=pipeline,
+                            source=args.source,
+                            concurrency=args.concurrency or 2,
+                            csv_writer=csv_writer,
+                            traces_writer=traces_writer,
+                            retrieval_setting=s_name,
+                        )
+            finally:
+                await client.close()
 
         print("\n" + "=" * 70)
         print("  BENCHMARK SUITE COMPLETE!")
@@ -332,7 +464,6 @@ async def main():
         print("=" * 70 + "\n")
 
     finally:
-        await client.close()
         standin_mgr.stop()
 
 

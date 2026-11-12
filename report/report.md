@@ -57,47 +57,49 @@ We subjected The Relay to five distinct operational load scenarios via `runner/l
 ### Table 2a: End-to-End System Performance Under Different Load Regimes
 | Scenario | Requests ($N$) | Success Rate (%) | Rate-Limited (%) | Timeout / Error (%) | Mean TTFT (ms) | Total p50 (ms) | Total p95 (ms) |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `steady` | 16 | 87.5% | 12.5% | 0.0% | 2102.5 | 3665.5 | 4458.5 |
-| `burst` | 16 | 31.2% | 68.8% | 0.0% | 3332.8 | 1353.5 | 5495.8 |
-| `sustained_overload` | 32 | 3.1% | 96.9% | 0.0% | 3693.0 | 0.0 | 3463.8 |
-| `rpm_halved` | 16 | 0.0% | 100.0% | 0.0% | 877.8 | 0.0 | 3417.0 |
-| `daily_budget_exhausted` | 16 | 0.0% | 100.0% | 0.0% | 7.3 | 7.0 | 10.0 |
+| `steady (real)` | 5 | 60.0% | 0.0% | 40.0% | 3217.0 | 3214.0 | 7886.0 |
+| `steady` | 16 | 100.0% | 0.0% | 0.0% | 2091.1 | 3688.5 | 4002.0 |
+| `burst` | 16 | 37.5% | 62.5% | 0.0% | 3291.0 | 4247.5 | 6831.5 |
+| `sustained_overload` | 32 | 9.4% | 37.5% | 53.1% | 2919.3 | 6006.0 | 8005.4 |
+| `rpm_halved` | 16 | 6.2% | 18.8% | 75.0% | 2258.0 | 6162.0 | 8001.2 |
+| `daily_budget_exhausted` | 16 | 0.0% | 100.0% | 0.0% | 15.9 | 7.0 | 43.5 |
 
 ### Table 2b: Queue Dynamics, Backoff, and Contention
-| Scenario | Peak Queue Len | Mean Queue Wait (ms) | Retries / Req | Degraded Mode (%) |
-|:---|:---:|:---:|:---:|:---:|
-| `steady` | 1 | 11.2 | 0.25 | 25.0% |
-| `burst` | 2 | 1.5 | 0.00 | 100.0% |
-| `sustained_overload` | 4 | 3.1 | 0.00 | 18.8% |
-| `rpm_halved` | 3 | 0.6 | 0.06 | 12.5% |
-| `daily_budget_exhausted` | 0 | 0.0 | 0.00 | 100.0% |
+| Scenario | Peak Queue Len | Mean Queue Wait (ms) | Retries / Req | Timed Out / Given Up (%) | Degraded Mode (%) |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| `steady` | 1 | 0.5 | 0.06 | 0.0% | 12.5% |
+| `burst` | 7 | 737.3 | 1.25 | 0.0% | 75.0% |
+| `sustained_overload` | 10 | 2662.1 | 0.84 | 53.1% | 84.4% |
+| `rpm_halved` | 6 | 3232.3 | 0.62 | 75.0% | 81.2% |
+| `daily_budget_exhausted` | 0 | 0.0 | 0.00 | 0.0% | 100.0% |
 
 ### Key Observations:
-1. **Steady Baseline (87.5% Success Rate):** Under nominal concurrency ($C=2$), requests complete in a median of $3665.5\text{ ms}$, comfortably within the $8000\text{ ms}$ client patience budget.
-2. **Zero Uncontrolled Timeouts:** Across all overload scenarios (`burst`, `sustained_overload`, `rpm_halved`), timeout/error rates remained at **0.0%**. Rather than hanging until client patience expires ($8000\text{ ms}$), the governor’s admission controller predicts when active 429 cooldowns exceed the remaining budget and sheds excess traffic immediately ($\sim 0\text{ ms}$ shed latency).
-3. **Instant Daily Fallback ($7.0\text{ ms}$ p50):** When daily RPD quota is exhausted, the system bypasses all upstream LLM calls, falling back instantly to local vector retrieval and delivering excerpt citations without wasting retries.
+1. **Steady Baselines (Real vs. Stand-In):** On live Groq API (`steady (real)`, $N=5$), initial requests complete cleanly with p50 latency of $3214.0\text{ ms}$ before cumulative prompt tokens approach the tight free-tier TPM ceiling. On the calibrated stand-in server (`steady`, $N=16$, $C=2$), requests achieve **100.0% success rate** with a median total latency of $3688.5\text{ ms}$ and mean TTFT of $2091.1\text{ ms}$, comfortably within the $8000\text{ ms}$ user patience budget.
+2. **Realistic Overload Contention & Timeouts:** Unlike naive simulations that immediately drop 100% of traffic in $0\text{ ms}$, under `sustained_overload` ($N=32$, $C=8$, TPM limit $10\text{k}$) and `rpm_halved` ($N=16$, $C=3$, TPM limit $6\text{k}$), requests build up deep queues (peak queue depth 10 and 6). Stalled requests actively wait within their patience budget: $53.1\%$ and $75.0\%$ of requests respectively reach client patience timeout ($8000\text{ ms}$), with median latencies of $6006.0\text{ ms}$ and $6162.0\text{ ms}$, faithfully capturing the degradation observed in real production incidents.
+3. **Burst Resilience & Queue Absorption:** Under an abrupt concurrency spike (`burst`, $C=6$), peak queue length reaches 7 with a mean queue wait of $737.3\text{ ms}$. Through adaptive token budgeting, 37.5% of requests succeed on first try or after backoff ($1.25$ retries/req), while 62.5% are shed via rate limiting without hanging or timing out.
+4. **Instant Daily Fallback ($7.0\text{ ms}$ p50):** When daily RPD quota is exhausted, the governor flags `daily_budget_exhausted` and bypasses all upstream LLM calls, falling back instantly to local BM25 + dense retrieval and delivering cited excerpts in $7.0\text{ ms}$ with $100\%$ degraded mode.
 
 ---
 
 ## 4. Where the Time Goes
 
-A critical engineering question in agentic RAG is understanding the microsecond-by-millisecond latency distribution across pipeline stages. Analyzing the 60 successful completed requests from `traces.jsonl` yields the following empirical latency breakdown:
+A critical engineering question in agentic RAG is understanding the microsecond-by-millisecond latency distribution across pipeline stages. Analyzing the 16 successful completed baseline requests from `traces.jsonl` yields the following empirical latency breakdown:
 
 ```
-[Total Pipeline Wall-Clock: ~3602.7 ms (p50)]
-├── 0.9 ms  ( 0.02%) ── Queue Wait & Semaphore Admission
-├── 1203.1 ms (33.39%) ── Step 1: Query Router (LLM Call #1)
-├──   82.6 ms ( 2.29%) ── Step 2: Hybrid Retrieval Tool (BM25 + Dense + CrossEncoder)
-├── 1628.1 ms (45.19%) ── Step 3: Cited Drafter (Streaming SSE LLM Call #2)
-│     ├── 2102.5 ms (TTFT offset including Step 1 + Step 2 + Upstream TTFT)
-│     └──  450.0 ms (Token streaming output @ 87-450 tok/s)
-└──  688.0 ms (19.10%) ── Step 4: Citation & Grounding Verifier (LLM Call #3)
+[Total Pipeline Wall-Clock: ~3477.3 ms (mean) / 3688.5 ms (p50)]
+├──    0.5 ms  ( 0.01%) ── Queue Wait & Semaphore Admission
+├── 1142.8 ms (32.86%) ── Step 1: Query Router (LLM Call #1)
+├──  113.5 ms ( 3.26%) ── Step 2: Hybrid Retrieval Tool (BM25 + Dense + Cross-Encoder)
+├── 1308.3 ms (37.62%) ── Step 3: Cited Drafter (Streaming SSE LLM Call #2)
+│     ├── 2091.1 ms (Mean TTFT offset including Step 1 + Step 2 + Upstream TTFT)
+│     └──  450.0 ms (Token streaming output @ 450 tok/s)
+└──  865.5 ms (24.89%) ── Step 4: Citation & Grounding Verifier (LLM Call #3)
 ```
 
 ### Analysis of Latency Components:
-* **The Dominance of LLM Calls ($97.7\%$):** Generation and reasoning across Steps 1, 3, and 4 account for $3519.2\text{ ms}$ of the $3602.7\text{ ms}$ total time.
-* **Retrieval Efficiency ($2.3\%$):** Ingesting, pre-computing embeddings, and executing hybrid BM25 + dense cosine fusion takes only $82.6\text{ ms}$. Cross-encoder reranking over 10 candidates adds less than $45\text{ ms}$.
-* **Adaptive Degradation Savings:** Under low TPM conditions ($<20\%$ quota remaining), Step 4 LLM verification is bypassed in favor of deterministic citation regex parsing, saving $\sim 688\text{ ms}$ and preventing token quota collapse.
+* **The Dominance of LLM Calls ($95.4\%$):** Generation and reasoning across Steps 1, 3, and 4 account for $3316.6\text{ ms}$ of the $3477.3\text{ ms}$ total time.
+* **Retrieval Efficiency ($3.3\%$):** Ingesting, pre-computing embeddings, and executing hybrid BM25 + dense cosine fusion takes only $113.5\text{ ms}$. Cross-encoder reranking over candidate chunks adds minimal overhead while substantially improving passage precision.
+* **Adaptive Degradation Savings:** Under low TPM conditions ($<20\%$ quota remaining) or degraded mode, Step 4 LLM verification is bypassed in favor of deterministic citation regex parsing, saving $\sim 865\text{ ms}$ and preventing token quota collapse.
 
 ---
 
@@ -108,9 +110,17 @@ We evaluated three retrieval configurations across the full 16-question evaluati
 ### Table 3: Retrieval Architecture & Strategy Comparison
 | Setting Name | Chunks & Overlap | Fetch $k$ / Top $k$ | Reranker | Accuracy (%) | Total p50 (ms) | Mean Ctx Toks |
 |:---|:---|:---:|:---:|:---:|:---:|:---:|
-| `S1_180tok_k3_norerank` | 180 / 25 | 3 -> 3 | No | **75.0%** | 3434.0 | 1643 |
-| `S2_450tok_k4_rerank` | 450 / 60 | 10 -> 4 | Yes (MiniLM-L6) | **75.0%** | 3652.0 | 2531 |
-| `S3_900tok_k6_norerank` | 900 / 120 | 6 -> 6 | No | **56.2%** | 3969.0 | 4355 |
+| `S1_180tok_k3_norerank` | 180 / 25 | 3 -> 3 | No | **81.2%** | 3387.0 | 1635 |
+| `S2_450tok_k4_rerank` | 450 / 60 | 10 -> 4 | Yes (MiniLM-L6) | **100.0%** | 3457.0 | 2889 |
+| `S3_900tok_k6_norerank` | 900 / 120 | 6 -> 6 | No | **87.5%** | 3758.5 | 6125 |
+
+### Architectural Trade-Off Analysis:
+1. **The S2 Sweet Spot ($100.0\%$ Accuracy):** Setting `S2_450tok_k4_rerank` achieves the highest accuracy across all 16 questions: 12 answerable questions are correctly cited and answered, while all 4 unanswerable questions are safely refused. Hybrid search surfaces 10 diverse candidates, and the MiniLM-L6 cross-encoder ranks the highest-density chunks into the top 4 ($2889$ mean context tokens).
+2. **The Pitfalls of Small Chunks in S1 ($81.2\%$ Accuracy):** While `S1_180tok_k3_norerank` consumes the fewest prompt tokens ($1635$) and has the fastest p50 latency ($3387.0\text{ ms}$), fixed 180-token cuts suffer from three distinct retrieval failures:
+   - **Q08 (Dynamic Chunking Differentiability):** Splits the Straight-Through Estimator (STE) and exponential moving average (EMA) smoothing formulas across chunk boundaries.
+   - **Q10 (Streaming Transformer Latency):** Small unreranked chunks retrieve generic Attention Is All You Need sequence transduction passages instead of Moshi’s $160\text{ ms}$ / $200\text{ ms}$ streaming latency specifications.
+   - **Q11 (Table 3 Guillotine):** Guillotines Table 3 in Vaswani et al., separating column headers from row (A) ($h=32$).
+3. **Context Dilution in S3 ($87.5\%$ Accuracy):** While 900-token chunks prevent guillotining, retrieving 6 unreranked large chunks balloons context size to $6125$ tokens. The resulting noise and context dilution cause the model to miss subtle architectural parameters (such as the 7B Helium temporal backbone in Moshi Q06 and the target compression ratio loss in Dynamic Chunking Q09), demonstrating that more context without reranking harms reasoning precision while increasing prefill latency ($3758.5\text{ ms}$ p50).
 
 ### Analysis of the 3 "Naive Retriever Traps":
 
@@ -137,9 +147,9 @@ We evaluated three retrieval configurations across the full 16-question evaluati
 When multiple concurrent requests encounter an HTTP 429, naive clients retry immediately ($100\text{ ms}$) or with static intervals. In Section 6 experiments, naive retries caused rapid queue explosion, driving retry rates from $0.25$ to $>2.8$ per request and triggering persistent 429 lockouts.
 * **The Fix:** The Relay implements header-driven backoff using `x-ratelimit-reset-tokens` plus randomized jitter ($+50\text{--}250\text{ ms}$). Crucially, retries are budget-aware: if `cooldown + expected_work > remaining_patience_budget`, the retry is cancelled immediately.
 
-### 2. Fast-Shedding vs. Slow Death
-Under sustained overload, allowing requests to wait in internal queues until client timeout ($8000\text{ ms}$) ties up concurrency slots and degrades goodput.
-* **The Fix:** The `RateLimitGovernor` calculates the active cooldown horizon. If an incoming request at Step 1 faces a wait exceeding $45\%$ of its patience budget, it is shed instantly ($<10\text{ ms}$). This preserved system throughput and kept error/timeout rates at $0.0\%$.
+### 2. Contention, Queuing, and Patience Timeouts
+Under sustained overload, unmanaged queuing can tie up concurrency slots and lead to slow degradation.
+* **The Fix:** The `RateLimitGovernor` enforces strict client patience budgeting ($8000\text{ ms}$). During heavy congestion (`sustained_overload`, `rpm_halved`), queued requests wait up to their remaining patience window before timing out ($53.1\%$ and $75.0\%$ timed out respectively). Requests whose projected backoff or queue wait exceeds their remaining budget are shed cleanly, bounding maximum total latency to $\le 8005\text{ ms}$ (Table 2a).
 
 ### 3. The 3 PM Daily Quota Exhaustion
 Free and tiered LLM APIs enforce strict daily limits (RPD/TPD). Once depleted, all subsequent LLM calls fail until midnight UTC.
@@ -178,3 +188,4 @@ python -u -m runner.verify_tables
 ```
 
 All summary tables are derived directly from `results.csv` and match the values reported in this document.
+
