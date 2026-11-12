@@ -77,7 +77,7 @@ DEFAULT_RETRIEVAL_SETTING = "S2_450tok_k4_rerank"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 STANDIN_BASE_URL = "http://127.0.0.1:8000/openai/v1"
-MODEL_NAME = "llama-3.1-8b-instant"
+MODEL_NAME = "qwen/qwen3.8-27b"
 
 # Client patience budget ("people give up sooner than you expect")
 USER_PATIENCE_BUDGET_MS = 8000

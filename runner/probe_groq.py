@@ -49,11 +49,17 @@ async def probe_real_groq():
         print(f"  {k}: {v}")
 
     if ttfts:
+        tpss = [
+            (toks / (tot / 1000.0))
+            for toks, tot in zip([res.tokens_out for _ in range(len(totals))], totals)
+            if tot > 0
+        ]
         calibration = {
             "model": MODEL_NAME,
             "ttft_p50_ms": float(np.percentile(ttfts, 50)),
             "ttft_p95_ms": float(np.percentile(ttfts, 95)),
             "total_p50_ms": float(np.percentile(totals, 50)),
+            "tps_p50": float(np.percentile(tpss, 50)) if tpss else 450.0,
             "headers": sample_headers,
         }
         Path("data/calibration.json").write_text(json.dumps(calibration, indent=2))

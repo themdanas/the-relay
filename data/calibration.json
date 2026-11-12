@@ -1,0 +1,15 @@
+{
+  "model": "qwen/qwen3.8-27b",
+  "ttft_p50_ms": 568.0132500019681,
+  "ttft_p95_ms": 582.4563585985743,
+  "total_p50_ms": 700.1799160025257,
+  "tps_p50": 87.12046519166363,
+  "headers": {
+    "x-ratelimit-limit-requests": "1000",
+    "x-ratelimit-limit-tokens": "8000",
+    "x-ratelimit-remaining-requests": "995",
+    "x-ratelimit-remaining-tokens": "7724",
+    "x-ratelimit-reset-requests": "7m12s",
+    "x-ratelimit-reset-tokens": "14.34s"
+  }
+}
